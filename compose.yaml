@@ -1,0 +1,13 @@
+services:
+  xiaodu-dlna-proxy:
+    build:
+      context: .
+    container_name: xiaodu-dlna-proxy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      UPSTREAM_DESCRIPTION_URL: http://XIAODU_IP:49495/description.xml
+      HTTP_PORT: "18080"
+      LOG_LEVEL: INFO
+      # ADVERTISE_HOST: 192.168.1.10
+      # FIXED_UUID: 12345678-1234-1234-1234-123456789abc
