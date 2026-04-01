@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      UPSTREAM_DESCRIPTION_URL: http://XIAODU_IP:49495/description.xml
+      UPSTREAM_FRIENDLY_NAME: XIAODU_FRIENDLY_NAME
       HTTP_PORT: "18080"
       LOG_LEVEL: INFO
       # ADVERTISE_HOST: 192.168.1.10

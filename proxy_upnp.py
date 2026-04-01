@@ -36,7 +36,8 @@ class DeviceProfile:
 
 @dataclass(frozen=True)
 class ProxyConfig:
-    upstream_description_url: str
+    upstream_description_url: str | None
+    upstream_friendly_name: str
     fixed_uuid: str
     mac_address: str | None
     bind_host: str
@@ -44,6 +45,7 @@ class ProxyConfig:
     advertise_host: str
     cache_ttl: int
     request_timeout: float
+    discovery_timeout: float
     ssdp_max_age: int
     notify_interval: int
     server_header: str
@@ -51,10 +53,6 @@ class ProxyConfig:
     @property
     def location_url(self) -> str:
         return f"http://{self.advertise_host}:{self.http_port}/description.xml"
-
-    @property
-    def upstream_base(self) -> str:
-        return upstream_base_url(self.upstream_description_url)
 
 
 def normalize_uuid(value: str) -> str:
@@ -70,6 +68,10 @@ def local_mac_address() -> str:
 
 def derive_uuid_from_mac(mac_address: str) -> str:
     return str(uuid.uuid5(PROXY_UUID_NAMESPACE, mac_address.lower()))
+
+
+def normalize_friendly_name(value: str) -> str:
+    return " ".join(value.split())
 
 
 def upstream_base_url(description_url: str) -> str:
@@ -182,13 +184,131 @@ def rewrite_description_xml(
     return rewritten_xml, profile
 
 
+def parse_url_host_port(url: str) -> tuple[str, int]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"invalid upstream description URL: {url}")
+    if parsed.port is not None:
+        return parsed.hostname, parsed.port
+    return parsed.hostname, 443 if parsed.scheme == "https" else 80
+
+
+def discover_ssdp_locations(
+    *,
+    timeout: float,
+    bind_host: str = "0.0.0.0",
+    search_targets: tuple[str, ...] = (
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "upnp:rootdevice",
+        "ssdp:all",
+    ),
+) -> tuple[str, ...]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(timeout)
+        sock.bind((bind_host, 0))
+        mx = max(1, min(int(timeout), 5))
+        for search_target in search_targets:
+            payload = "\r\n".join(
+                [
+                    "M-SEARCH * HTTP/1.1",
+                    f"HOST: {MULTICAST_HOST}:{MULTICAST_PORT}",
+                    'MAN: "ssdp:discover"',
+                    f"MX: {mx}",
+                    f"ST: {search_target}",
+                    "",
+                    "",
+                ]
+            ).encode("utf-8")
+            sock.sendto(payload, (MULTICAST_HOST, MULTICAST_PORT))
+
+        deadline = time.time() + timeout
+        seen: set[str] = set()
+        locations: list[str] = []
+        while time.time() < deadline:
+            remaining = max(0.1, deadline - time.time())
+            sock.settimeout(remaining)
+            try:
+                response, _address = sock.recvfrom(8192)
+            except socket.timeout:
+                break
+            headers = parse_headers(response.decode("utf-8", errors="ignore"))
+            location = headers.get("location")
+            if location and location not in seen:
+                seen.add(location)
+                locations.append(location)
+        return tuple(locations)
+    finally:
+        sock.close()
+
+
+def discover_upstream_description_url(
+    friendly_name: str,
+    *,
+    timeout: float,
+) -> str:
+    wanted_name = normalize_friendly_name(friendly_name)
+    locations = discover_ssdp_locations(timeout=timeout)
+    if not locations:
+        raise ValueError(f"no SSDP responses found while looking for {friendly_name!r}")
+
+    seen_names: list[str] = []
+    for location in locations:
+        try:
+            description_xml = fetch_url(location, timeout=timeout)
+            profile = extract_profile(ET.fromstring(description_xml))
+        except Exception as exc:
+            LOGGER.debug("Skipping SSDP candidate %s: %s", location, exc)
+            continue
+
+        if profile.friendly_name:
+            seen_names.append(profile.friendly_name)
+            if normalize_friendly_name(profile.friendly_name) == wanted_name:
+                return location
+
+    if seen_names:
+        raise ValueError(
+            f"could not find SSDP device named {friendly_name!r}; saw: {', '.join(seen_names)}"
+        )
+    raise ValueError(f"could not find SSDP device named {friendly_name!r}")
+
+
 class UpstreamDescriptionCache:
     def __init__(self, config: ProxyConfig):
         self.config = config
         self._lock = threading.Lock()
+        self._upstream_description_url = config.upstream_description_url
         self._description_xml: bytes | None = None
         self._profile: DeviceProfile | None = None
         self._expires_at = 0.0
+
+    def can_discover(self) -> bool:
+        return self.config.upstream_friendly_name is not None
+
+    def resolve_upstream_description_url(self, force_refresh: bool = False) -> str:
+        with self._lock:
+            if not force_refresh and self._upstream_description_url is not None:
+                return self._upstream_description_url
+
+        if self.config.upstream_friendly_name is None:
+            if self.config.upstream_description_url is None:
+                raise ValueError("no upstream source configured")
+            return self.config.upstream_description_url
+
+        resolved_url = discover_upstream_description_url(
+            self.config.upstream_friendly_name,
+            timeout=self.config.discovery_timeout,
+        )
+        with self._lock:
+            previous = self._upstream_description_url
+            self._upstream_description_url = resolved_url
+        if previous and previous != resolved_url:
+            LOGGER.info("Upstream LOCATION changed: %s -> %s", previous, resolved_url)
+        return resolved_url
+
+    def upstream_base(self, force_refresh: bool = False) -> str:
+        return upstream_base_url(self.resolve_upstream_description_url(force_refresh=force_refresh))
 
     def get(self, force_refresh: bool = False) -> tuple[bytes, DeviceProfile]:
         with self._lock:
@@ -200,13 +320,20 @@ class UpstreamDescriptionCache:
             if cache_is_fresh:
                 return self._description_xml, self._profile  # type: ignore[return-value]
 
-        raw_xml = fetch_url(
-            self.config.upstream_description_url, timeout=self.config.request_timeout
+        description_url = self.resolve_upstream_description_url(
+            force_refresh=force_refresh or self.can_discover()
         )
+        try:
+            raw_xml = fetch_url(description_url, timeout=self.config.request_timeout)
+        except Exception:
+            if not self.can_discover():
+                raise
+            description_url = self.resolve_upstream_description_url(force_refresh=True)
+            raw_xml = fetch_url(description_url, timeout=self.config.request_timeout)
         rewritten_xml, profile = rewrite_description_xml(
             raw_xml,
             fixed_uuid=self.config.fixed_uuid,
-            description_url=self.config.upstream_description_url,
+            description_url=description_url,
         )
 
         with self._lock:
@@ -292,36 +419,30 @@ class DescriptionHandler(BaseHTTPRequestHandler):
             self.wfile.write(description_xml)
 
     def proxy_to_upstream(self, include_body: bool = True) -> None:
-        config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
-        upstream_url = urllib.parse.urljoin(config.upstream_base, self.path)
+        cache: UpstreamDescriptionCache = self.server.cache  # type: ignore[attr-defined]
         request_body = self._read_request_body()
         request_headers = self._build_upstream_headers()
-        request = urllib.request.Request(
-            upstream_url,
-            data=request_body,
-            headers=request_headers,
-            method=self.command,
-        )
-
         try:
-            with urllib.request.urlopen(request, timeout=config.request_timeout) as response:
-                status = response.status
-                response_headers = response.headers
-                response_body = response.read()
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            response_headers = exc.headers
-            response_body = exc.read()
+            status, response_headers, response_body = self._proxy_request_once(
+                urllib.parse.urljoin(cache.upstream_base(), self.path),
+                request_body,
+                request_headers,
+            )
         except urllib.error.URLError as exc:
-            LOGGER.warning("Upstream proxy request failed for %s: %s", upstream_url, exc)
-            payload = f"upstream proxy failed: {exc}\n".encode()
-            self.send_response(HTTPStatus.BAD_GATEWAY)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            if include_body:
-                self.wfile.write(payload)
-            return
+            if not cache.can_discover():
+                LOGGER.warning("Upstream proxy request failed for %s: %s", self.path, exc)
+                self._send_upstream_error(include_body, exc)
+                return
+            try:
+                status, response_headers, response_body = self._proxy_request_once(
+                    urllib.parse.urljoin(cache.upstream_base(force_refresh=True), self.path),
+                    request_body,
+                    request_headers,
+                )
+            except urllib.error.URLError as retry_exc:
+                LOGGER.warning("Upstream proxy request failed for %s: %s", self.path, retry_exc)
+                self._send_upstream_error(include_body, retry_exc)
+                return
 
         self.send_response(status)
         for header, value in response_headers.items():
@@ -338,6 +459,34 @@ class DescriptionHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if include_body:
             self.wfile.write(response_body)
+
+    def _proxy_request_once(
+        self,
+        upstream_url: str,
+        request_body: bytes | None,
+        request_headers: dict[str, str],
+    ) -> tuple[int, object, bytes]:
+        config: ProxyConfig = self.server.config  # type: ignore[attr-defined]
+        request = urllib.request.Request(
+            upstream_url,
+            data=request_body,
+            headers=request_headers,
+            method=self.command,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=config.request_timeout) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def _send_upstream_error(self, include_body: bool, exc: Exception) -> None:
+        payload = f"upstream proxy failed: {exc}\n".encode()
+        self.send_response(HTTPStatus.BAD_GATEWAY)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(payload)
 
     def _build_upstream_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"User-Agent": "xiaodu-dlna-proxy/1.0"}
@@ -529,9 +678,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Proxy a UPnP MediaRenderer with a stable UUID."
     )
     parser.add_argument(
-        "--upstream-description-url",
+        "--upstream-friendly-name",
         required=True,
-        help="Original description.xml URL from the speaker.",
+        help="Discover the upstream speaker via SSDP and match this exact friendlyName.",
     )
     parser.add_argument(
         "--fixed-uuid",
@@ -568,6 +717,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds for upstream HTTP requests. Default: 5.0",
     )
     parser.add_argument(
+        "--discovery-timeout",
+        type=float,
+        default=3.0,
+        help="Seconds to wait for SSDP discovery responses. Default: 3.0",
+    )
+    parser.add_argument(
         "--ssdp-max-age",
         type=int,
         default=1800,
@@ -589,14 +744,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def parse_config(args: argparse.Namespace) -> ProxyConfig:
-    upstream = urllib.parse.urlparse(args.upstream_description_url)
-    if upstream.scheme not in {"http", "https"} or not upstream.hostname:
-        raise ValueError("upstream-description-url must include scheme and host")
-
-    upstream_port = upstream.port
-    if upstream_port is None:
-        upstream_port = 443 if upstream.scheme == "https" else 80
-
     mac_address: str | None = None
     if args.fixed_uuid:
         fixed_uuid = normalize_uuid(args.fixed_uuid)
@@ -604,9 +751,16 @@ def parse_config(args: argparse.Namespace) -> ProxyConfig:
         mac_address = local_mac_address()
         fixed_uuid = derive_uuid_from_mac(mac_address)
 
-    advertise_host = args.advertise_host or detect_local_ip(upstream.hostname, upstream_port)
+    upstream_description_url = discover_upstream_description_url(
+        args.upstream_friendly_name,
+        timeout=args.discovery_timeout,
+    )
+
+    upstream_host, upstream_port = parse_url_host_port(upstream_description_url)
+    advertise_host = args.advertise_host or detect_local_ip(upstream_host, upstream_port)
     return ProxyConfig(
-        upstream_description_url=args.upstream_description_url,
+        upstream_description_url=upstream_description_url,
+        upstream_friendly_name=args.upstream_friendly_name,
         fixed_uuid=fixed_uuid,
         mac_address=mac_address,
         bind_host=args.bind_host,
@@ -614,6 +768,7 @@ def parse_config(args: argparse.Namespace) -> ProxyConfig:
         advertise_host=advertise_host,
         cache_ttl=args.cache_ttl,
         request_timeout=args.request_timeout,
+        discovery_timeout=args.discovery_timeout,
         ssdp_max_age=args.ssdp_max_age,
         notify_interval=args.notify_interval,
         server_header="xiaodu-dlna-proxy/1.0 UPnP/1.0 DLNADOC/1.50",
@@ -628,6 +783,7 @@ def warm_cache(cache: UpstreamDescriptionCache) -> DeviceProfile:
 def run_server(config: ProxyConfig) -> None:
     cache = UpstreamDescriptionCache(config)
     profile = warm_cache(cache)
+    LOGGER.info("Resolved upstream description: %s", cache.resolve_upstream_description_url())
     LOGGER.info(
         "Loaded upstream device %s (%s)",
         profile.friendly_name or "<unknown>",

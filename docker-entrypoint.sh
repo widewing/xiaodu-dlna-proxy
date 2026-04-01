@@ -1,14 +1,12 @@
 #!/bin/sh
 set -eu
 
-: "${UPSTREAM_DESCRIPTION_URL:?UPSTREAM_DESCRIPTION_URL is required}"
-
 HTTP_PORT="${HTTP_PORT:-18080}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 set -- \
   python3 /app/proxy_upnp.py \
-  --upstream-description-url "$UPSTREAM_DESCRIPTION_URL" \
+  --upstream-friendly-name "${UPSTREAM_FRIENDLY_NAME:?UPSTREAM_FRIENDLY_NAME is required}" \
   --http-port "$HTTP_PORT" \
   --log-level "$LOG_LEVEL"
 
@@ -30,6 +28,10 @@ fi
 
 if [ -n "${REQUEST_TIMEOUT:-}" ]; then
   set -- "$@" --request-timeout "$REQUEST_TIMEOUT"
+fi
+
+if [ -n "${DISCOVERY_TIMEOUT:-}" ]; then
+  set -- "$@" --discovery-timeout "$DISCOVERY_TIMEOUT"
 fi
 
 if [ -n "${SSDP_MAX_AGE:-}" ]; then

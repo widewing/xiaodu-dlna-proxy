@@ -22,30 +22,36 @@
 
 默认情况下，这个稳定 `uuid` 会基于代理宿主机的 MAC 地址生成，所以同一台机器重启后仍然保持不变；如果想完全手工控制，也可以显式传入 `--fixed-uuid`。
 
+## 上游发现方式
+
+这个项目现在只支持一种上游定位方式：用 `--upstream-friendly-name` 通过 SSDP 发现设备，再按 `friendlyName` 精确匹配。
+
+这样做是因为小度不仅 `uuid` 会变，连 `description.xml` 的端口也会变。把上游地址写死在启动参数里，本质上还是不稳定。现在代理会先发一次 SSDP `M-SEARCH`，找到当前设备广播出来的 `LOCATION`，再去拉最新的 `description.xml`。后续如果上游端口再次变化，代理也会在刷新或转发失败时重新发现一次。
+
 ## 运行
 
 ```bash
 python3 proxy_upnp.py \
-  --upstream-description-url 'http://XIAODU_IP:49495/description.xml' \
+  --upstream-friendly-name '小度智能音箱-2026' \
   --advertise-host '192.168.1.10' \
   --http-port 18080
 ```
 
 参数说明：
 
-- `--upstream-description-url`: 原始小度的 `description.xml`
+- `--upstream-friendly-name`: 通过 SSDP 发现上游设备时，按这个 `friendlyName` 匹配
 - `--fixed-uuid`: 可选。手工指定的固定 `uuid`
 - `--advertise-host`: 局域网里其他设备能访问到这台代理机器的 IP
 - `--http-port`: 代理的 HTTP 端口，`LOCATION` 会指到这里
 
-如果不传 `--advertise-host`，程序会根据上游音箱地址自动探测本机局域网 IP。
+如果不传 `--advertise-host`，程序会根据已经解析到的上游设备地址自动探测本机局域网 IP。
 如果不传 `--fixed-uuid`，程序会基于本机 MAC 地址生成一个稳定 UUID。
 
 ## Docker
 
 仓库里已经带了 [Dockerfile](/Users/guani/Development/xiaodu-dlna-proxy/Dockerfile) 和 [compose.yaml](/Users/guani/Development/xiaodu-dlna-proxy/compose.yaml)。
 
-先修改 `compose.yaml` 里的 `UPSTREAM_DESCRIPTION_URL`，然后启动：
+先修改 `compose.yaml` 里的 `UPSTREAM_FRIENDLY_NAME`，然后启动：
 
 ```bash
 docker compose up -d --build
@@ -56,12 +62,13 @@ compose 默认使用 `network_mode: host`，因为 SSDP 发现依赖 `1900/udp` 
 ```bash
 docker build -t xiaodu-dlna-proxy .
 docker run --rm --network host \
-  -e UPSTREAM_DESCRIPTION_URL='http://XIAODU_IP:49495/description.xml' \
+  -e UPSTREAM_FRIENDLY_NAME='小度智能音箱-2026' \
   xiaodu-dlna-proxy
 ```
 
 可选环境变量：
 
+- `UPSTREAM_FRIENDLY_NAME`: 通过 SSDP 按设备名发现上游设备
 - `ADVERTISE_HOST`: 手工覆盖自动探测的对外 IP
 - `FIXED_UUID`: 手工覆盖基于本机 MAC 派生的 UUID
 - `HTTP_PORT`: 默认 `18080`
