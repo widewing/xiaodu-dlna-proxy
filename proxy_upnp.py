@@ -54,6 +54,10 @@ class ProxyConfig:
     def location_url(self) -> str:
         return f"http://{self.advertise_host}:{self.http_port}/description.xml"
 
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.advertise_host}:{self.http_port}/"
+
 
 def normalize_uuid(value: str) -> str:
     raw = value.removeprefix("uuid:").strip()
@@ -98,11 +102,20 @@ def fetch_url(url: str, timeout: float) -> bytes:
         return response.read()
 
 
-def absolute_url(base_url: str, candidate: str) -> str:
-    text = candidate.strip()
-    if not text:
-        return text
-    return urllib.parse.urljoin(base_url, text)
+def proxy_url(proxy_base_url: str, upstream_base_url: str, candidate: str) -> str:
+    upstream_url = urllib.parse.urljoin(upstream_base_url, candidate.strip())
+    parsed = urllib.parse.urlparse(upstream_url)
+    proxy_base = urllib.parse.urlparse(proxy_base_url)
+    return urllib.parse.urlunparse(
+        (
+            proxy_base.scheme,
+            proxy_base.netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 def _child_text(element: ET.Element | None, name: str) -> str | None:
@@ -132,10 +145,13 @@ def extract_profile(root: ET.Element) -> DeviceProfile:
 
 
 def rewrite_description_xml(
-    original_xml: bytes, fixed_uuid: str, description_url: str
+    original_xml: bytes,
+    fixed_uuid: str,
+    description_url: str,
+    proxy_base_url: str,
 ) -> tuple[bytes, DeviceProfile]:
     root = ET.fromstring(original_xml)
-    base_url = upstream_base_url(description_url)
+    upstream_base = upstream_base_url(description_url)
     device = root.find("upnp:device", NS)
     if device is None:
         raise ValueError("UPnP description has no root device")
@@ -172,12 +188,12 @@ def rewrite_description_xml(
             continue
         local_name = element.tag.rsplit("}", 1)[1]
         if local_name in url_like_tags and element.text and element.text.strip():
-            element.text = absolute_url(base_url, element.text)
+            element.text = proxy_url(proxy_base_url, upstream_base, element.text)
 
     url_base = root.find("upnp:URLBase", NS)
     if url_base is None:
         url_base = ET.SubElement(root, f"{{{UPNP_NS}}}URLBase")
-    url_base.text = base_url
+    url_base.text = proxy_base_url
 
     profile = extract_profile(root)
     rewritten_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
@@ -334,6 +350,7 @@ class UpstreamDescriptionCache:
             raw_xml,
             fixed_uuid=self.config.fixed_uuid,
             description_url=description_url,
+            proxy_base_url=self.config.base_url,
         )
 
         with self._lock:

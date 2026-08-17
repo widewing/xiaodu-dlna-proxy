@@ -7,6 +7,7 @@ from proxy_upnp import (
     build_advertisements,
     discover_upstream_description_url,
     derive_uuid_from_mac,
+    proxy_url,
     rewrite_description_xml,
 )
 
@@ -56,6 +57,16 @@ OTHER_XML = b"""<?xml version="1.0"?>
 
 
 class RewriteDescriptionXmlTests(unittest.TestCase):
+    def test_proxy_url_replaces_upstream_origin_and_preserves_request_target(self) -> None:
+        self.assertEqual(
+            proxy_url(
+                "http://192.168.41.161:18080/",
+                "http://192.168.41.104:49495/",
+                "http://192.168.41.104:49495/upnp/control/rendertransport1?foo=bar",
+            ),
+            "http://192.168.41.161:18080/upnp/control/rendertransport1?foo=bar",
+        )
+
     def test_derive_uuid_from_mac_is_deterministic(self) -> None:
         self.assertEqual(
             derive_uuid_from_mac("aa:bb:cc:dd:ee:ff"),
@@ -87,6 +98,7 @@ class RewriteDescriptionXmlTests(unittest.TestCase):
             SAMPLE_XML,
             fixed_uuid="11111111-2222-3333-4444-555555555555",
             description_url="http://192.168.41.104:49495/description.xml",
+            proxy_base_url="http://192.168.41.161:18080/",
         )
 
         root = ET.fromstring(rewritten_xml)
@@ -96,15 +108,15 @@ class RewriteDescriptionXmlTests(unittest.TestCase):
 
         url_base = root.find("upnp:URLBase", NS)
         self.assertIsNotNone(url_base)
-        self.assertEqual(url_base.text, "http://192.168.41.104:49495/")
+        self.assertEqual(url_base.text, "http://192.168.41.161:18080/")
 
         icon_url = root.find(".//upnp:icon/upnp:url", NS)
-        self.assertEqual(icon_url.text, "http://192.168.41.104:49495/icon.png")
+        self.assertEqual(icon_url.text, "http://192.168.41.161:18080/icon.png")
 
         control_url = root.find(".//upnp:service/upnp:controlURL", NS)
         self.assertEqual(
             control_url.text,
-            "http://192.168.41.104:49495/control/transport",
+            "http://192.168.41.161:18080/control/transport",
         )
 
         friendly_name = root.find(".//upnp:device/upnp:friendlyName", NS)
@@ -122,6 +134,7 @@ class RewriteDescriptionXmlTests(unittest.TestCase):
             SAMPLE_XML,
             fixed_uuid="11111111-2222-3333-4444-555555555555",
             description_url="http://192.168.41.104:49495/description.xml",
+            proxy_base_url="http://192.168.41.161:18080/",
         )
         advertisements = build_advertisements(
             profile, fixed_uuid="11111111-2222-3333-4444-555555555555"
